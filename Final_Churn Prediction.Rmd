@@ -299,7 +299,7 @@ df[numeric_cols] <- scale(df[numeric_cols])
 | 9    | Create and print comparison table      | Summarize metrics across all models          |
 | 10   | Output Markdown table                  | Prepare for reporting or documentation       |
 
-```{r 8, echo=TRUE}
+```{r 9, echo=TRUE}
 set.seed(123)
 # 15. Train-test split
 train_index <- createDataPartition(df$Churn, p = 0.8, list = FALSE)
