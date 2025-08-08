@@ -1,0 +1,469 @@
+---
+title: "Churn Prediction"
+author: "Yuvraj Singh Chauhan"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## EDA & Cleaning
+
+### 1. Explore
+
+```{r 1, echo=TRUE}
+# Load required libraries
+library(tidyverse)  # For data manipulation and visualization
+library(caret)      # For machine learning and preprocessing
+library(pROC)       # For ROC AUC
+library(corrplot)   # For correlation matrix
+library(gridExtra)  # For arranging plots
+library(xgboost)    # For XGBoost model
+
+# Set random seed for reproducibility
+set.seed(123)
+
+# 1. Load and inspect the data
+df <- read.csv("Customer_Churn.csv")
+
+# See the structure and sample rows
+head(df)
+
+# Check column types and missing values
+str(df)
+
+# Summary stats for numeric columns
+summary(df)
+```
+
+### 2. Missing Values
+
+```{r 2, echo=TRUE}
+
+# 2. Check for missing values
+missing_values <- colSums(is.na(df))
+missing_percent <- (missing_values / nrow(df)) * 100
+
+# Combine for easy viewing
+missing_df <- data.frame(
+  Missing_Values = missing_values,
+  Percent_Missing = missing_percent
+)
+
+# Filter only columns with missing values
+missing_df <- missing_df[missing_df$Missing_Values > 0, ]
+cat("Missing Values Summary:\n")
+print(missing_df)
+```
+
+### 3. Total Charges column
+
+Rows with tenure=0, total charges should be equal to monthly charges.
+
+```{r 3, echo=TRUE}
+# 3. Handle TotalCharges column
+# Check datatype of TotalCharges
+cat("TotalCharges class before:", class(df$TotalCharges), "\n")
+
+# Identify non-numeric rows before conversion
+non_numeric_totalcharges <- df[!is.numeric(as.numeric(df$TotalCharges, na.rm = TRUE)) & !is.na(df$TotalCharges), ]
+cat("Rows with non-numeric TotalCharges:\n")
+print(non_numeric_totalcharges[, c("customerID", "tenure", "MonthlyCharges", "TotalCharges")])
+
+# Convert TotalCharges to numeric, setting non-numeric to NA
+df$TotalCharges <- as.numeric(df$TotalCharges)
+
+# Print rows with NA in TotalCharges after conversion
+cat("\nRows with NA in TotalCharges after conversion:\n")
+print(df[is.na(df$TotalCharges), c("customerID", "tenure", "MonthlyCharges", "TotalCharges")])
+
+# Set TotalCharges = MonthlyCharges where tenure is 0
+df$TotalCharges[df$tenure == 0] <- df$MonthlyCharges[df$tenure == 0]
+
+# Verify final class
+cat("\nTotalCharges class after:", class(df$TotalCharges), "\n")
+
+# Verify no NA values remain
+cat("Number of NA values in TotalCharges after processing:", sum(is.na(df$TotalCharges)), "\n")
+
+```
+
+### Duplicates in Customer ID column
+
+```{r 4, echo=TRUE}
+# 4. Check duplicates in customerID
+duplicate_customers <- sum(duplicated(df$customerID))
+cat("Number of duplicate customerID entries:", duplicate_customers, "\n")
+```
+
+### Convert SeniorCitizen from 0,1 to 'No','Yes'
+
+```{r 5, echo=TRUE}
+cat("Before conversion:\n")
+cat("SeniorCitizen class:", class(df$SeniorCitizen), "\n")
+cat("SeniorCitizen unique values:\n")
+print(table(df$SeniorCitizen, useNA = "ifany"))
+
+df$SeniorCitizen <- factor(ifelse(df$SeniorCitizen == 0, "No", "Yes"))
+
+cat("\nAfter conversion:\n")
+cat("SeniorCitizen class:", class(df$SeniorCitizen), "\n")
+cat("SeniorCitizen unique values:\n")
+print(table(df$SeniorCitizen, useNA = "ifany"))
+```
+
+### Numrical and categorical columns
+
+```{r 6, echo=TRUE}
+
+# 6. Get categorical columns (except customerID)
+categorical_cols <- names(df)[sapply(df, is.character) | sapply(df, is.factor)]
+categorical_cols <- categorical_cols[categorical_cols != "customerID"]
+
+# Display unique values for each categorical column
+for (col in categorical_cols) {
+  cat("\n", col, "unique values:\n")
+  print(table(df[[col]], useNA = "ifany"))
+}
+
+# 7. Numeric columns analysis
+numeric_cols <- names(df)[sapply(df, is.numeric) & names(df) != "customerID"]
+
+# Summary stats
+cat("Descriptive Stats:\n")
+print(summary(df[, numeric_cols]))
+
+# Boxplots to visualize outliers
+for (col in numeric_cols) {
+  p <- ggplot(df, aes_string(y = col)) +
+    geom_boxplot() +
+    ggtitle(paste("Boxplot of", col))
+  print(p)
+}
+
+# 8. Bar plots and proportions for categorical columns
+for (col in categorical_cols) {
+  p <- ggplot(df, aes_string(x = col)) +
+    geom_bar() +
+    ggtitle(paste("Distribution of", col)) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  print(p)
+  
+  cat("\nProportions for", col, ":\n")
+  print(prop.table(table(df[[col]])) * 100)
+}
+
+# 9. Histograms and stats for numeric features
+for (col in numeric_cols) {
+  p <- ggplot(df, aes_string(x = col)) +
+    geom_histogram(bins = 30, aes(y = ..density..)) +
+    geom_density(color = "blue") +
+    ggtitle(paste("Distribution of", col))
+  print(p)
+  
+  cat("\nSummary statistics for", col, ":\n")
+  print(summary(df[[col]]))
+  cat("Skewness:", psych::skew(df[[col]]), "\n")
+}
+```
+
+### Churn Analysis
+
+```{r 7, echo=TRUE}
+
+library(tidyverse)
+
+# 10. Churn analysis by categorical variables
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+# Assuming categorical_cols is a vector of categorical column names except "Churn"
+categorical_cols <- setdiff(categorical_cols, "Churn")
+
+for (col in categorical_cols) {
+  churn_df <- df %>%
+    filter(!is.na(.data[[col]]), !is.na(Churn)) %>%
+    group_by(Category = .data[[col]], Churn) %>%   # Rename col in group_by
+    summarise(Count = n(), .groups = "drop") %>%
+    group_by(Category) %>%
+    mutate(Proportion = Count / sum(Count)) %>%
+    ungroup()
+  
+  # Plot stacked bar chart
+  p <- ggplot(churn_df, aes(x = Category, y = Proportion, fill = Churn)) +
+    geom_bar(stat = "identity", position = "stack") +
+    ggtitle(paste("Churn by", col)) +
+    ylab("Proportion") +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+    scale_fill_viridis_d()
+  
+  print(p)
+}
+
+
+# 11. Boxplots by Churn
+for (col in numeric_cols) {
+  p <- ggplot(df, aes_string(x = "Churn", y = col)) +
+    geom_boxplot() +
+    ggtitle(paste(col, "by Churn"))
+  print(p)
+}
+
+# 12. Correlation matrix
+correlation_matrix <- cor(df[, numeric_cols], use = "complete.obs")
+corrplot(correlation_matrix, method = "color", type = "upper", tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", col = colorRampPalette(c("blue", "white", "red"))(200),
+         title = "Correlation Matrix")
+
+# 13. Statistical Tests
+# T-test for numeric columns by Churn
+for (col in numeric_cols) {
+  cat("\nT-test for", col, "by Churn:\n")
+  churn_yes <- df[[col]][df$Churn == "Yes"]
+  churn_no <- df[[col]][df$Churn == "No"]
+  print(t.test(churn_yes, churn_no))
+}
+
+# Mann-Whitney U test for numeric columns
+for (col in numeric_cols) {
+  cat("\nMann-Whitney U test for", col, "by Churn:\n")
+  print(wilcox.test(df[[col]] ~ df$Churn))
+}
+
+# Chi-square test for categorical columns
+for (col in categorical_cols) {
+  cat("\nChi-square test for", col, "and Churn:\n")
+  contingency_table <- table(df[[col]], df$Churn)
+  print(chisq.test(contingency_table))
+}
+
+# 14. Preprocessing for modeling
+# Encode binary categorical columns
+binary_cols <- c("gender", "Partner", "Dependents", "SeniorCitizen", "PhoneService", 
+                 "PaperlessBilling", "Churn")
+
+for (col in binary_cols) {
+  if (col %in% names(df)) {
+    df[[col]] <- as.numeric(factor(df[[col]], levels = c("No", "Yes", "Male", "Female"))) - 1
+  }
+}
+```
+
+### Feature Engineering and Pre-processing
+
+**In Summary: This Code Chunk**
+
+| Step | Task                                   | Purpose                            |
+|--------------|------------------------------|----------------------------|
+| 1    | Select multi-class categorical columns | Prepare for one-hot encoding       |
+| 2    | Encode them with `dummyVars()`         | Convert to machine-readable format |
+| 3    | Combine with main dataframe            | Finalize transformed feature set   |
+| 4    | Drop unnecessary columns               | Reduce noise and redundancy        |
+| 5    | Scale numeric features                 | Normalize for ML models            |
+
+```{r 8, echo=TRUE}
+
+# One-hot encoding for multi-category variables
+multi_cat_cols <- c("MultipleLines", "InternetService", "OnlineSecurity", "OnlineBackup", 
+                    "DeviceProtection", "TechSupport", "StreamingTV", "StreamingMovies", 
+                    "Contract", "PaymentMethod")
+
+# Create dummy variables
+dummy_model <- dummyVars(~ ., data = df[multi_cat_cols], fullRank = TRUE)
+df_dummies <- predict(dummy_model, df[multi_cat_cols])
+df <- cbind(df[, !names(df) %in% multi_cat_cols], df_dummies)
+
+# Drop non-predictive features
+df <- df[, !names(df) %in% c("customerID", "gender", "PhoneService")]
+
+# Scale numeric features
+numeric_cols <- c("tenure", "MonthlyCharges", "TotalCharges")
+df[numeric_cols] <- scale(df[numeric_cols])
+```
+
+### Model evaluation pipeline
+
+| Step | Task                                   | Purpose                                      |
+|--------------|---------------------------|-------------------------------|
+| 1    | Split data into train and test sets    | Separate training and evaluation data        |
+| 2    | Convert target variable to factor      | Ensure consistency in classification labels  |
+| 3    | Define cross-validation settings       | Enable reliable model performance estimation |
+| 4    | Train models (LogReg, RF, XGBoost)     | Fit different algorithms to training data    |
+| 5    | Evaluate models using CV ROC AUC       | Assess model performance during training     |
+| 6    | Predict on test set                    | Generate outcomes for unseen data            |
+| 7    | Compute confusion matrix and metrics   | Evaluate accuracy, precision, F1, ROC AUC    |
+| 8    | Plot confusion matrices and ROC curves | Visualize model performance                  |
+| 9    | Create and print comparison table      | Summarize metrics across all models          |
+| 10   | Output Markdown table                  | Prepare for reporting or documentation       |
+
+```{r 8, echo=TRUE}
+set.seed(123)
+# 15. Train-test split
+train_index <- createDataPartition(df$Churn, p = 0.8, list = FALSE)
+X_train <- df[train_index, !names(df) %in% "Churn"]
+y_train <- df[train_index, "Churn"]
+X_test <- df[-train_index, !names(df) %in% "Churn"]
+y_test <- df[-train_index, "Churn"]
+
+# 16. Cross-validation for model evaluation
+models <- list(
+  "Logistic Regression" = trainControl(method = "cv", number = 5, summaryFunction = twoClassSummary, classProbs = TRUE),
+  "Random Forest" = trainControl(method = "cv", number = 5, summaryFunction = twoClassSummary, classProbs = TRUE),
+  "XGBoost" = trainControl(method = "cv", number = 5, summaryFunction = twoClassSummary, classProbs = TRUE)
+)
+
+# Load required libraries
+library(caret)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(knitr)  # For Markdown table
+
+# Wrap confusion matrix plot in a function
+plot_confusion_matrix <- function(y_true, y_pred, model_name) {
+  cm <- table(Predicted = y_pred, Actual = y_true)
+  ggplot(as.data.frame(cm), aes(x = Predicted, y = Actual, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq)) +
+    scale_fill_gradient(low = "white", high = "blue") +
+    ggtitle(paste("Confusion Matrix:", model_name)) +
+    theme_minimal()
+}
+
+# Format y_train and y_test
+y_train <- factor(y_train, levels = c(0, 1), labels = c("No", "Yes"))
+y_test <- factor(y_test, levels = c(0, 1), labels = c("No", "Yes"))
+
+
+#Training models
+
+# Actually train the models
+
+
+log_reg <- train(
+  x = X_train,
+  y = y_train,
+  method = "glm",
+  family = "binomial",
+  trControl = models[["Logistic Regression"]],
+  metric = "ROC"
+)
+
+rf_model <- train(
+  x = X_train,
+  y = y_train,
+  method = "rf",
+  trControl = models[["Random Forest"]],
+  metric = "ROC"
+)
+
+xgb_model <- train(
+  x = X_train,
+  y = y_train,
+  method = "xgbTree",
+  trControl = models[["XGBoost"]],
+  metric = "ROC"
+)
+
+
+# Model list
+model_list <- list(
+  "Logistic Regression" = log_reg,
+  "Random Forest" = rf_model,
+  "XGBoost" = xgb_model
+)
+
+# --- Model Evaluation (Cross-validation) ---
+cat("\nCross-Validation ROC AUC Scores (5-fold):\n")
+for (name in names(model_list)) {
+  model <- model_list[[name]]
+  # Extract ROC AUC scores based on model type
+  if (name == "Logistic Regression") {
+    cv_scores <- model$results$ROC
+  } else {
+    cv_scores <- model$resample$ROC
+    if (length(cv_scores) == 0 || all(is.na(cv_scores))) {
+      match_params <- apply(model$results[, names(model$bestTune), drop = FALSE], 1, function(row) {
+        all(row == model$bestTune)
+      })
+      cv_scores <- model$results$ROC[match_params]
+    }
+  }
+  cat(name, ": Mean ROC AUC =", round(mean(cv_scores, na.rm = TRUE), 4), 
+      "(±", round(sd(cv_scores, na.rm = TRUE), 4), ")\n")
+}
+
+# --- Test Set Evaluation with Comparison Table ---
+cat("\n=== Test Set Evaluation ===\n")
+
+# Initialize a list to store metrics
+metrics_list <- list()
+
+for (name in names(model_list)) {
+  model <- model_list[[name]]
+  y_pred <- predict(model, X_test)
+  y_proba <- predict(model, X_test, type = "prob")[, "Yes"]
+  
+  # Compute metrics
+  cm <- confusionMatrix(y_pred, y_test, positive = "Yes")
+  auc_roc <- roc(y_test, y_proba, quiet = TRUE)$auc
+  
+  # Extract metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]  # <-- Added Recall
+  f1_score <- cm$byClass["F1"]
+  
+  # Store metrics as a named vector
+  metrics_list[[name]] <- c(
+    Accuracy = as.numeric(accuracy),
+    AUC_ROC = as.numeric(auc_roc),
+    Precision = as.numeric(precision),
+    Recall = as.numeric(recall),     # <-- Store Recall
+    F1_Score = as.numeric(f1_score)
+  )
+  
+  # Print confusion matrix and plot
+  cat("\n--", name, "--\n")
+  cat("ROC AUC Score:", round(auc_roc, 4), "\n")
+  print(cm)
+  print(plot_confusion_matrix(y_test, y_pred, name))
+  
+  # Plot ROC Curves
+  plot(roc(y_test, y_proba), main = paste("ROC Curve:", name))
+}
+
+# Create comparison table
+comparison_table <- bind_rows(metrics_list, .id = "Model") %>%
+  mutate(
+    Accuracy = round(Accuracy, 4),
+    AUC_ROC = round(AUC_ROC, 4),
+    Precision = round(Precision, 4),
+    Recall = round(Recall, 4),             # <-- Round Recall
+    F1_Score = round(F1_Score, 4)
+  ) %>%
+  select(Model, Accuracy, AUC_ROC, Precision, Recall, F1_Score)  # <-- Add Recall column
+
+# Print comparison table
+cat("\n=== Model Comparison Table ===\n")
+print(comparison_table)
+
+# Output comparison table as Markdown
+markdown_table <- kable(comparison_table, format = "markdown", digits = 4)
+
+```
+
+### Conclusion
+
+After evaluating three classification models — Logistic Regression, Random Forest, and XGBoost — on multiple performance metrics, XGBoost emerges as the most suitable model for our churn prediction task.
+
+Despite Logistic Regression having slightly higher AUC_ROC (0.8619 vs. 0.8659), XGBoost demonstrates the best overall balance:
+
+-   Highest F1 Score (0.6272), indicating strong balance between precision (0.7153) and recall (0.5584).
+
+-   Highest Accuracy (0.8345), suggesting strong overall classification.
+
+Recall is crucial in our context, as we aim to minimize false negatives i.e., customers wrongly predicted as staying when they are likely to churn. XGBoost’s recall (0.5584) is significantly better than Random Forest (0.3732) and nearly matches Logistic Regression (0.5613), but with better overall metrics.
